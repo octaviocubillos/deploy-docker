@@ -11,7 +11,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/TU_USUARIO_GIT/deploy-docker.git"
+    "url": "git+https://github.com/octaviocubillos/deploy-docker.git"
   },
   "keywords": [
     "docker",
@@ -23,9 +23,9 @@
   "author": "Octavio Cubillos",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/TU_USUARIO_GIT/deploy-docker/issues"
+    "url": "https://github.com/octaviocubillos/deploy-docker/issues"
   },
-  "homepage": "https://github.com/TU_USUARIO_GIT/deploy-docker#readme",
+  "homepage": "https://github.com/octaviocubillos/deploy-docker#readme",
   "dependencies": {
     "minimist": "^1.2.8",
     "archiver": "^7.0.1",
