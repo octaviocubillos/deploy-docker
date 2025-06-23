@@ -8,9 +8,6 @@ const { NodeSSH } = require('node-ssh');
 const semver = require('semver');
 const args = require('minimist')(process.argv.slice(2));
 
-
-let remoteEnvPath = null; // Variable para guardar la ruta del archivo .env remoto
-
 // --- Lógica Principal ---
 async function main() {
     const forceDeploy = args.force || args.f || false;
@@ -43,12 +40,15 @@ async function main() {
 
 // --- Flujos de Despliegue ---
 async function deployLocal(config, force = false, recreate = false) {
-    console.log(`🚀 Iniciando despliegue LOCAL versionado...`);
-    const { name: baseName, version, port, buildDir, main: entrypoint = 'index.js' } = config;
+    console.log(`🚀 Iniciando despliegue LOCAL para tipo '${config.deployType}'...`);
+    const { name: baseName, version, port, buildDir, main: entrypoint } = config;
     const finalContainerName = `${baseName}-${version}`;
     const finalVolumeName = `${baseName}-data-${version}`;
     config.name = finalContainerName;
     config.volume = finalVolumeName;
+
+    const buildPackageJsonPath = path.join(buildDir, 'package.json');
+    let packageJsonWasCreated = false;
 
     try {
         await checkProductionVersion(config, force, recreate);
@@ -72,8 +72,9 @@ async function deployLocal(config, force = false, recreate = false) {
             }
         }
         
-        if (!fs.existsSync(buildDir) || !fs.existsSync(path.join(buildDir, entrypoint))) {
-            console.error(`\x1b[31mError: La carpeta '${buildDir}' o su archivo principal '${entrypoint}' no existen.\x1b[0m`);
+        const checkFile = config.deployType === 'static' ? 'index.html' : entrypoint;
+        if (!fs.existsSync(buildDir) || !fs.existsSync(path.join(buildDir, checkFile))) {
+            console.error(`\x1b[31mError: La carpeta '${buildDir}' o su archivo principal '${checkFile}' no existen.\x1b[0m`);
             process.exit(1);
         }
 
@@ -82,15 +83,24 @@ async function deployLocal(config, force = false, recreate = false) {
         if (config.dockerOptions && config.dockerOptions.networks) {
             await ensureNetworksExist(config.dockerOptions.networks);
         }
+        
         const { finalEnv } = buildEnvironment(config);
-        performTokenReplacement(config, finalEnv);
-        const volumeHasCode = run(`docker run --rm -v "${finalVolumeName}:/app" alpine ls /app/${entrypoint} 2>/dev/null || true`).includes(entrypoint);
+        if (config.deployType === 'node') {
+            performTokenReplacement(config, finalEnv);
+            console.log(`- Limpiando y preparando package.json para producción...`);
+            const cleanPackageJsonContent = createCleanPackageJson(config);
+            fs.writeFileSync(buildPackageJsonPath, cleanPackageJsonContent);
+            packageJsonWasCreated = true;
+        }
+        
+        const volumeHasCode = run(`docker run --rm -v "${finalVolumeName}:/app" alpine ls /app/${checkFile} 2>/dev/null || true`).includes(checkFile);
         if (!volumeHasCode) {
             console.log("-> El volumen está vacío. Copiando código...");
             run(`docker run --rm -v "${path.resolve(buildDir)}:/origen" -v "${finalVolumeName}:/destino" alpine sh -c "cp -a /origen/. /destino/"`);
         } else {
             console.log("-> El volumen ya contiene código. Saltando copia.");
         }
+        
         const finalCommand = buildDockerCommand(config).join(' ');
         console.log('▶️  Lanzando el nuevo contenedor...');
         run(finalCommand);
@@ -99,15 +109,20 @@ async function deployLocal(config, force = false, recreate = false) {
         await pruneOldVersions(config);
         console.log(`\n🎉 ¡Éxito! El servicio '${finalContainerName}' está en ejecución localmente.`);
         console.log(`   URL: http://localhost:${port}`);
+
     } catch (error) {
         console.error(`\x1b[31m${error.message}\x1b[0m`);
         process.exit(1);
+    } finally {
+        if (packageJsonWasCreated) {
+            fs.unlinkSync(buildPackageJsonPath);
+        }
     }
 }
 
 async function deployRemote(config, force = false, recreate = false) {
-    console.log(`🚀 Iniciando despliegue REMOTO versionado a '${config.remote.host}'...`);
-    const { name: baseName, version, remote, main: entrypoint = 'index.js', buildDir } = config;
+    console.log(`🚀 Iniciando despliegue REMOTO para tipo '${config.deployType}' a '${config.remote.host}'...`);
+    const { name: baseName, version, remote, buildDir, main: entrypoint } = config;
     const remoteBasePath = remote.path || `~/apps/${baseName}`;
     const finalContainerName = `${baseName}-${version}`;
     const finalVolumeName = `${baseName}-data-${version}`;
@@ -116,23 +131,19 @@ async function deployRemote(config, force = false, recreate = false) {
 
     const ssh = new NodeSSH();
     const archiveName = 'deploy.tar.gz';
+    const buildPackageJsonPath = path.join(buildDir, 'package.json');
+    let packageJsonWasCreated = false;
+    let remoteEnvPath = null;
 
     try {
         const connectionConfig = { host: remote.host, username: remote.user };
-        if (remote.privateKeyPath) {
-            console.log(' -> Usando autenticación por clave SSH.');
-            connectionConfig.privateKeyPath = remote.privateKeyPath;
-        } else if (remote.password) {
-            console.log(' -> Usando autenticación por contraseña.');
-            connectionConfig.password = remote.password;
-        } else {
-            throw new Error('Debe proporcionar "privateKeyPath" o "password" en la configuración remota.');
-        }
-        console.log('🔌 Conectando al servidor...');
+        if (remote.privateKeyPath) { connectionConfig.privateKeyPath = remote.privateKeyPath; } 
+        else if (remote.password) { connectionConfig.password = remote.password; } 
+        else { throw new Error('Debe proporcionar "privateKeyPath" o "password".'); }
         await ssh.connect(connectionConfig);
-        
-        await checkProductionVersion(config, force, recreate, ssh);
 
+        await checkProductionVersion(config, force, recreate, ssh);
+        
         if (recreate) {
             console.log(`\x1b[33m--rm flag detectado. Eliminando completamente la versión ${version} en el servidor remoto...\x1b[0m`);
             await ssh.execCommand(`docker stop ${finalContainerName} && docker rm ${finalContainerName}`, { onStderr: () => {} });
@@ -143,60 +154,92 @@ async function deployRemote(config, force = false, recreate = false) {
             if (oldContainer) {
                 const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
                 const archiveName = `${finalContainerName}-old-${timestamp}`;
-                console.log(` -> Renombrando contenedor '${finalContainerName}' a '${archiveName}'...`);
                 await ssh.execCommand(`docker stop ${finalContainerName} && docker rename ${finalContainerName} ${archiveName}`);
-                console.log(`\x1b[33m   -> Nota: El volumen antiguo '${finalVolumeName}' no se puede renombrar y queda disponible para recuperación manual.\x1b[0m`);
+                console.log(`\x1b[33m   -> Contenedor renombrado a '${archiveName}'. El volumen antiguo '${finalVolumeName}' queda disponible.\x1b[0m`);
             }
         }
         
         await stopAllOtherVersions(baseName, finalContainerName, ssh);
         await ensureVolumeExists(finalVolumeName, ssh);
-        if (config.dockerOptions && config.dockerOptions.networks) {
-            await ensureNetworksExist(config.dockerOptions.networks, ssh);
+        if (config.dockerOptions.networks) await ensureNetworksExist(config.dockerOptions.networks, ssh);
+
+        const { finalEnv, finalEnvContent } = buildEnvironment(config);
+        if (config.deployType === 'node') {
+            performTokenReplacement(config, finalEnv);
+            console.log(`- Limpiando y preparando package.json para producción...`);
+            const cleanPackageJsonContent = createCleanPackageJson(config);
+            fs.writeFileSync(buildPackageJsonPath, cleanPackageJsonContent);
+            packageJsonWasCreated = true;
         }
         
-        const { finalEnv, finalEnvContent } = buildEnvironment(config);
-        performTokenReplacement(config, finalEnv);
-        
         const { stdout: volumeHasCode } = await ssh.execCommand(`docker run --rm -v "${finalVolumeName}:/app" alpine ls /app/${entrypoint} 2>/dev/null`);
-        //if (!volumeHasCode.includes(entrypoint)) {
+        if (!volumeHasCode.includes(entrypoint)) {
             console.log("-> El volumen remoto está vacío. Subiendo código...");
             await compressDirectory(buildDir, archiveName);
             const remoteTempDir = `/tmp/deploy-${Date.now()}`;
-            console.log({remoteTempDir})
             await ssh.execCommand(`mkdir -p ${remoteTempDir}`);
             await ssh.putFile(path.resolve(archiveName), `${remoteTempDir}/${archiveName}`);
             await ssh.execCommand(`tar -xzf ${archiveName} -C ${remoteTempDir}`, { cwd: remoteTempDir });
             const copyToVolumeCmd = `docker run --rm -v "${remoteTempDir}:/origen" -v "${finalVolumeName}:/destino" alpine sh -c "cp -a /origen/. /destino/"`;
             await ssh.execCommand(copyToVolumeCmd);
-           // await ssh.execCommand(`rm -rf ${remoteTempDir}`);
-        // } else {
-        //     console.log("-> El volumen remoto ya contiene código. Saltando subida.");
-        // }
+            await ssh.execCommand(`rm -rf ${remoteTempDir}`);
+        } else {
+            console.log("-> El volumen remoto ya contiene código. Saltando subida.");
+        }
         
-         if (finalEnvContent) {
-            remoteEnvPath = `${remoteTempDir}/.env.deploy.tmp`;
-            console.log(`🔒 Creando archivo de entorno temporal en el servidor: ${remoteEnvPath}`);
+        if (finalEnvContent && config.deployType === 'node') {
+            remoteEnvPath = `${remoteBasePath}/.env.deploy.tmp`;
+            console.log(`🔒 Escribiendo variables de entorno en el servidor: ${remoteEnvPath}`);
             const escapedContent = finalEnvContent.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
             await ssh.execCommand(`cat <<'EOF' > ${remoteEnvPath}\n${escapedContent}\nEOF`);
         }
-        const dockerCommand = buildDockerCommand(config, true);
+
+        const dockerCommand = buildDockerCommand(config, true, remoteEnvPath);
         await ssh.execCommand(dockerCommand);
         console.log(`\n✅ Lanzamiento de ${finalContainerName} exitoso.`);
         await pruneOldVersions(config, ssh);
-
         console.log(`\n🎉 ¡Éxito! El servicio '${finalContainerName}' está en ejecución en '${remote.host}'.`);
 
     } catch (error) {
         console.error(`\x1b[31m${error.message}\x1b[0m`);
     } finally {
-        if (fs.existsSync(archiveName)) fs.unlinkSync(archiveName);
+        if (packageJsonWasCreated) {
+            fs.unlinkSync(buildPackageJsonPath);
+        }
+        if (remoteEnvPath) { await ssh.execCommand(`rm ${remoteEnvPath} 2>/dev/null || true`); }
+        if (fs.existsSync(archiveName)) { fs.unlinkSync(archiveName); }
         ssh.dispose();
     }
 }
 
 
 // --- Funciones de Ayuda y Gestión ---
+
+function createCleanPackageJson(config) {
+    const rootPackageJsonPath = path.join(process.cwd(), 'package.json');
+    if (!fs.existsSync(rootPackageJsonPath)) {
+        console.warn(`\x1b[33mAdvertencia: No se encontró el package.json raíz. Se creará uno básico.\x1b[0m`);
+        return JSON.stringify({
+            name: config.name.split('-').slice(0, -1).join('-'),
+            version: config.version,
+            description: "Paquete de despliegue autogenerado.",
+            main: config.main,
+            dependencies: {}
+        }, null, 2);
+    }
+
+    const originalPkg = JSON.parse(fs.readFileSync(rootPackageJsonPath, 'utf-8'));
+
+    const cleanPkg = {
+        name: originalPkg.name,
+        version: originalPkg.version,
+        description: originalPkg.description || "Despliegue de " + originalPkg.name,
+        main: originalPkg.main || config.main,
+        dependencies: originalPkg.dependencies || {}
+    };
+
+    return JSON.stringify(cleanPkg, null, 2);
+}
 
 function showHelp() {
     console.log(`
@@ -215,101 +258,118 @@ function showHelp() {
     `);
 }
 
-async function checkProductionVersion(config, force, recreate, ssh = null) {
-    const { finalEnv } = buildEnvironment(config);
-    const nodeEnv = finalEnv.get('NODE_ENV');
-    if (nodeEnv !== 'production') return;
-
-    console.log(`- Validando versión para entorno de PRODUCCIÓN...`);
-
-    if (force || recreate) {
-        console.log(`\x1b[33m  -> Saltando validación de versión debido a un flag de forzado (--force o --rm).\x1b[0m`);
-        return;
+function buildDockerCommand(config, isRemote = false, remoteEnvPath = null) {
+    if (config.deployType === 'static') {
+        return buildStaticDockerCommand(config, isRemote);
     }
-    
-    const { name: baseName, version: newVersion } = config;
-    const execute = ssh ? (cmd) => ssh.execCommand(cmd) : (cmd) => Promise.resolve({ stdout: run(cmd) });
-    const listCmd = `docker ps -a --format "{{.Names}}" --filter "name=^${baseName}-"`;
-    const { stdout: allVersionsOutput } = await execute(listCmd);
-
-    if (!allVersionsOutput) {
-        console.log('  -> No existen versiones previas. Despliegue permitido.');
-        return;
-    }
-
-    const deployedVersions = allVersionsOutput.split('\n').filter(Boolean).map(name => name.replace(`${baseName}-`, ''));
-    
-    if (deployedVersions.includes(newVersion)) {
-        throw new Error(`¡Despliegue bloqueado! La versión '${newVersion}' ya está desplegada en producción. Para forzar, usa el flag --force o --rm.`);
-    }
-
-    const latestDeployedVersion = deployedVersions.reduce((latest, v) => (semver.gt(v, latest) ? v : latest), '0.0.0');
-
-    if (!semver.gt(newVersion, latestDeployedVersion)) {
-        throw new Error(`¡Despliegue bloqueado! La nueva versión '${newVersion}' no es mayor que la última versión desplegada ('${latestDeployedVersion}').`);
-    }
-
-    console.log(`\x1b[32m  -> Verificación de versión exitosa. '${newVersion}' es una versión válida para desplegar.\x1b[0m`);
+    return buildNodeDockerCommand(config, isRemote, remoteEnvPath);
 }
 
-async function stopAllOtherVersions(baseName, currentContainerName, ssh = null) {
-    console.log(`- Buscando otras versiones de '${baseName}' para detener...`);
-    const execute = ssh ? (cmd) => ssh.execCommand(cmd) : (cmd) => Promise.resolve({ stdout: run(cmd) });
-    const listCmd = `docker ps -a --format "{{.Names}}" --filter "name=^${baseName}-"`;
-    const { stdout: runningContainers } = await execute(listCmd);
+function buildStaticDockerCommand(config, isRemote) {
+    const { name, port, volume, dockerOptions } = config;
+    const image = config.image;
 
-    if (runningContainers) {
-        const containersToStop = runningContainers.split('\n').filter(name => name && name !== currentContainerName);
-        if (containersToStop.length > 0) {
-            const containerIds = containersToStop.join(' ');
-            console.log(` -> Deteniendo contenedores antiguos: ${containerIds}`);
-            await execute(`docker stop ${containerIds}`);
-        } else {
-             console.log(` -> No se encontraron otras versiones para detener.`);
-        }
-    } else {
-        console.log(` -> No se encontraron otras versiones.`);
+    let dockerRunCmd = [
+        `docker run -d`,
+        `--name "${name}"`,
+        `-p "${port}:80"`,
+        `-v "${volume}:/usr/share/nginx/html:ro"`,
+    ];
+
+    if (dockerOptions.restart) dockerRunCmd.push(`--restart "${dockerOptions.restart}"`);
+    if (dockerOptions.networks) (dockerOptions.networks || []).forEach(net => dockerRunCmd.push(`--network "${net}"`));
+    if (dockerOptions.labels) (dockerOptions.labels || []).forEach(label => dockerRunCmd.push(`--label "${label}"`));
+    if (dockerOptions.memory) dockerRunCmd.push(`--memory "${dockerOptions.memory}"`);
+    if (dockerOptions.cpus) dockerRunCmd.push(`--cpus "${dockerOptions.cpus}"`);
+    
+    dockerRunCmd.push(`"${image}"`);
+    const dockerRunStr = dockerRunCmd.join(' ');
+    
+    if (isRemote) {
+        return `docker ps -a -q -f name=${name} | xargs -r docker stop && docker ps -a -q -f name=${name} | xargs -r docker rm && ${dockerRunStr}`;
+    }
+    return dockerRunCmd;
+}
+
+function buildNodeDockerCommand(config, isRemote = false, remoteEnvPath = null) {
+    const { name, port, volume, image, dockerOptions, main: entrypoint, customCommand } = config;
+    const { finalEnvContent } = buildEnvironment(config);
+    let dockerRunCmd = [`docker run -d`, `--name "${name}"`, `-p "${port}:3000"`, `-v "${volume}:/app"`, `-w /app`];
+
+    if (dockerOptions.cpus) dockerRunCmd.push(`--cpus "${dockerOptions.cpus}"`);
+    if (dockerOptions.memory) dockerRunCmd.push(`--memory "${dockerOptions.memory}"`);
+    if (dockerOptions.restart) dockerRunCmd.push(`--restart "${dockerOptions.restart}"`);
+    if (dockerOptions.hostname) dockerRunCmd.push(`--hostname "${dockerOptions.hostname}"`);
+    if (dockerOptions.user) dockerRunCmd.push(`--user "${dockerOptions.user}"`);
+    if (dockerOptions.networks) dockerOptions.networks.forEach(net => dockerRunCmd.push(`--network "${net}"`));
+    if (dockerOptions.addHost) dockerRunCmd.addHost.forEach(host => dockerRunCmd.push(`--add-host "${host}"`));
+    if (dockerOptions.labels) dockerOptions.labels.forEach(label => dockerRunCmd.push(`--label "${label}"`));
+    
+    if (finalEnvContent) {
+        const envPath = isRemote ? remoteEnvPath : path.resolve('.env.deploy.local');
+        if (!isRemote) fs.writeFileSync(envPath, finalEnvContent);
+        if (envPath) dockerRunCmd.push(`--env-file "${envPath}"`);
+    }
+    
+    dockerRunCmd.push(`"${image}"`);
+    
+    const finalExecCommand = customCommand || `sh -c "if [ ! -d 'node_modules' ]; then npm install; fi; node ${entrypoint}"`;
+    dockerRunCmd.push(finalExecCommand);
+
+    const dockerRunStr = dockerRunCmd.join(' ');
+    if (isRemote) {
+        return `docker ps -a -q -f name=${name} | xargs -r docker stop && docker ps -a -q -f name=${name} | xargs -r docker rm && ${dockerRunStr}`;
+    }
+    return dockerRunCmd;
+}
+
+function loadConfig(configFile) {
+    const configPath = path.resolve(configFile);
+    if (!fs.existsSync(configPath)) {
+        console.error(`\x1b[31mError: El archivo de configuración '${configPath}' no existe.\x1b[0m`);
+        process.exit(1);
+    }
+    
+    const userConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+
+    const baseDefaults = {
+        deployType: 'node',
+        dockerOptions: {},
+        buildDir: 'build'
+    };
+    
+    let config = { ...baseDefaults, ...userConfig };
+
+    const typeDefaults = {
+        main: config.deployType === 'static' ? 'index.html' : 'index.js',
+        image: config.deployType === 'static' ? 'nginx:alpine' : 'node:lts-slim'
+    };
+    
+    config = { ...baseDefaults, ...typeDefaults, ...userConfig };
+
+    return config;
+}
+
+function run(command) {
+    try {
+        return execSync(command, { stdio: 'pipe' }).toString().trim();
+    } catch (error) {
+        return "";
     }
 }
 
-async function pruneOldVersions(config, ssh = null) {
-    const { name: baseName, version: currentVersion } = config;
-    const keepVersions = config.keepVersions || 4;
-    console.log(`🧹 Realizando limpieza, manteniendo las últimas ${keepVersions} versiones de '${baseName}'...`);
-    
-    const execute = ssh ? (cmd) => ssh.execCommand(cmd) : (cmd) => Promise.resolve({ stdout: run(cmd) });
-    const listCmd = `docker ps -a --format "{{.Names}}\\t{{.CreatedAt}}" --filter "name=^${baseName}-"`;
-    const { stdout: allVersionsOutput } = await execute(listCmd);
-    
-    if (!allVersionsOutput) {
-        console.log(' -> No se encontraron versiones antiguas para limpiar.');
-        return;
+function compressDirectory(source, out) {
+    if (!fs.existsSync(source)) {
+        console.error(`\x1b[31mError: El directorio a comprimir '${source}' no existe.\x1b[0m`);
+        process.exit(1);
     }
-
-    const versions = allVersionsOutput.split('\n').map(line => {
-            const [name, createdAt] = line.split('\t');
-            return { name, createdAt: new Date(createdAt) };
-        })
-        .filter(v => v.name && v.name !== `${baseName}-${currentVersion}`)
-        .sort((a, b) => b.createdAt - a.createdAt);
-
-    if (versions.length > keepVersions) {
-        const versionsToPrune = versions.slice(keepVersions);
-        console.log(` -> Se encontraron ${versions.length} versiones antiguas. Se eliminarán ${versionsToPrune.length}.`);
-
-        for (const version of versionsToPrune) {
-            const oldContainerName = version.name;
-            const oldVersionTag = oldContainerName.replace(`${baseName}-`, '');
-            const oldVolumeName = `${baseName}-data-${oldVersionTag}`;
-            
-            console.log(`   - Eliminando versión antigua: ${oldContainerName}`);
-            await execute(`docker rm ${oldContainerName}`);
-            console.log(`   - Eliminando volumen asociado: ${oldVolumeName}`);
-            await execute(`docker volume rm ${oldVolumeName}`);
-        }
-    } else {
-        console.log(` -> Se encontraron ${versions.length} versiones antiguas. No se requiere limpieza.`);
-    }
+    const archive = archiver('tar', { gzip: true });
+    const stream = fs.createWriteStream(out);
+    return new Promise((resolve, reject) => {
+        archive.directory(source, false).on('error', err => reject(err)).pipe(stream);
+        stream.on('close', () => resolve());
+        archive.finalize();
+    });
 }
 
 async function ensureVolumeExists(volumeName, ssh = null) {
@@ -318,7 +378,6 @@ async function ensureVolumeExists(volumeName, ssh = null) {
     const execute = ssh ? (cmd) => ssh.execCommand(cmd) : (cmd) => Promise.resolve({ stdout: run(cmd) });
     const checkCmd = `docker volume ls -q -f name=^${volumeName}$`;
     const { stdout: exists } = await execute(checkCmd);
-
     if (!exists) {
         console.log(` -> Creando volumen...`);
         const createCmd = `docker volume create ${volumeName}`;
@@ -346,7 +405,7 @@ async function ensureNetworksExist(networks = [], ssh = null) {
 }
 
 function performTokenReplacement(config, finalEnv) {
-    const entrypoint = config.main || 'index.js';
+    const entrypoint = config.main;
     const entrypointFile = path.join(config.buildDir, entrypoint);
     if (!fs.existsSync(entrypointFile)) {
         console.warn(`\x1b[33mAdvertencia: No se encontró '${entrypointFile}' para reemplazo de tokens.\x1b[0m`);
@@ -382,77 +441,100 @@ function buildEnvironment(config) {
     return { finalEnv, finalEnvContent };
 }
 
-function buildDockerCommand(config, isRemote = false) {
-    const { name, port, volume, image, dockerOptions, main: entrypoint = 'index.js' } = config;
-    const { finalEnvContent, finalEnv } = buildEnvironment(config);
-    const envPort = finalEnv.get('PORT') || 3000;
+async function checkProductionVersion(config, force, recreate, ssh = null) {
+    const { finalEnv } = buildEnvironment(config);
+    const nodeEnv = finalEnv.get('NODE_ENV');
+    if (nodeEnv !== 'production') return;
+
+    console.log(`- Validando versión para PRODUCCIÓN...`);
+
+    if (force || recreate) {
+        console.log(`\x1b[33m  -> Saltando validación por flag --force o --rm.\x1b[0m`);
+        return;
+    }
     
-    let dockerRunCmd = [`docker run -d`, `--name "${name}"`, `-p "${port}:${envPort}"`, `-v "${volume}:/app"`, `-w /app`];
+    const { name: baseName, version: newVersion } = config;
+    const execute = ssh ? (cmd) => ssh.execCommand(cmd) : (cmd) => Promise.resolve({ stdout: run(cmd) });
+    const listCmd = `docker ps -a --format "{{.Names}}" --filter "name=^${baseName}-"`;
+    const { stdout: allVersionsOutput } = await execute(listCmd);
 
-    if (dockerOptions.cpus) dockerRunCmd.push(`--cpus "${dockerOptions.cpus}"`);
-    if (dockerOptions.memory) dockerRunCmd.push(`--memory "${dockerOptions.memory}"`);
-    if (dockerOptions.restart) dockerRunCmd.push(`--restart "${dockerOptions.restart}"`);
-    if (dockerOptions.hostname) dockerRunCmd.push(`--hostname "${dockerOptions.hostname}"`);
-    if (dockerOptions.user) dockerRunCmd.push(`--user "${dockerOptions.user}"`);
-    if (dockerOptions.networks) (dockerOptions.networks || []).forEach(net => dockerRunCmd.push(`--network "${net}"`));
-    if (dockerOptions.addHost) (dockerRunCmd.addHost || []).forEach(host => dockerRunCmd.push(`--add-host "${host}"`));
-    if (dockerOptions.labels) (dockerOptions.labels || []).forEach(label => dockerRunCmd.push(`--label "${label}"`));
+    if (!allVersionsOutput) {
+        console.log('  -> No existen versiones previas.');
+        return;
+    }
 
-    if (finalEnvContent) {
-        let envPath;
-        if (isRemote) {
-            envPath = remoteEnvPath;
+    const deployedVersions = allVersionsOutput.split('\n').filter(Boolean).map(name => name.replace(`${baseName}-`, ''));
+    
+    if (deployedVersions.includes(newVersion)) {
+        throw new Error(`¡Bloqueado! La versión '${newVersion}' ya está desplegada en producción. Usa --force o --rm para anular.`);
+    }
+
+    const latestDeployedVersion = deployedVersions.reduce((latest, v) => (semver.gt(v, latest) ? v : latest), '0.0.0');
+
+    if (!semver.gt(newVersion, latestDeployedVersion)) {
+        throw new Error(`¡Bloqueado! La nueva versión '${newVersion}' no es mayor que la última desplegada ('${latestDeployedVersion}').`);
+    }
+    console.log(`\x1b[32m  -> Verificación de versión exitosa.\x1b[0m`);
+}
+
+async function stopAllOtherVersions(baseName, currentContainerName, ssh = null) {
+    console.log(`- Buscando otras versiones de '${baseName}' para detener...`);
+    const execute = ssh ? (cmd) => ssh.execCommand(cmd) : (cmd) => Promise.resolve({ stdout: run(cmd) });
+    const listCmd = `docker ps -a --format "{{.Names}}" --filter "name=^${baseName}-"`;
+    const { stdout: runningContainers } = await execute(listCmd);
+
+    if (runningContainers) {
+        const containersToStop = runningContainers.split('\n').filter(name => name && name !== currentContainerName);
+        if (containersToStop.length > 0) {
+            const containerIds = containersToStop.join(' ');
+            console.log(` -> Deteniendo contenedores antiguos: ${containerIds}`);
+            await execute(`docker stop ${containerIds}`);
         } else {
-            envPath = path.resolve('.env.deploy.local');
-            fs.writeFileSync(envPath, finalEnvContent);
+             console.log(` -> No hay otras versiones para detener.`);
         }
-        
-        if (envPath) {
-            dockerRunCmd.push(`--env-file "${envPath}"`);
+    } else {
+        console.log(` -> No se encontraron otras versiones.`);
+    }
+}
+
+async function pruneOldVersions(config, ssh = null) {
+    const { name: baseName, version: currentVersion } = config;
+    const keepVersions = config.keepVersions || 4;
+    console.log(`🧹 Limpiando versiones antiguas, manteniendo las últimas ${keepVersions}...`);
+    
+    const execute = ssh ? (cmd) => ssh.execCommand(cmd) : (cmd) => Promise.resolve({ stdout: run(cmd) });
+    const listCmd = `docker ps -a --format "{{.Names}}\\t{{.CreatedAt}}" --filter "name=^${baseName}-"`;
+    const { stdout: allVersionsOutput } = await execute(listCmd);
+    
+    if (!allVersionsOutput) {
+        console.log(' -> No se encontraron versiones antiguas.');
+        return;
+    }
+
+    const versions = allVersionsOutput.split('\n').map(line => {
+            const [name, createdAt] = line.split('\t');
+            return { name, createdAt: new Date(createdAt) };
+        })
+        .filter(v => v.name && v.name !== `${baseName}-${currentVersion}`)
+        .sort((a, b) => b.createdAt - a.createdAt);
+
+    if (versions.length > keepVersions) {
+        const versionsToPrune = versions.slice(keepVersions);
+        console.log(` -> Se encontraron ${versions.length} versiones antiguas. Se eliminarán ${versionsToPrune.length}.`);
+
+        for (const version of versionsToPrune) {
+            const oldContainerName = version.name;
+            const oldVersionTag = oldContainerName.replace(`${baseName}-`, '');
+            const oldVolumeName = `${baseName}-data-${oldVersionTag}`;
+            
+            console.log(`   - Eliminando versión antigua: ${oldContainerName}`);
+            await execute(`docker rm ${oldContainerName}`);
+            console.log(`   - Eliminando volumen asociado: ${oldVolumeName}`);
+            await execute(`docker volume rm ${oldVolumeName}`);
         }
+    } else {
+        console.log(` -> No se requiere limpieza.`);
     }
-    
-    dockerRunCmd.push(`"${image}"`);
-    dockerRunCmd.push(`sh -c " npm install; node ${entrypoint}"`);
-
-    if (isRemote) {
-        return `docker ps -a -q -f name=${name} | xargs -r docker stop && docker ps -a -q -f name=${name} | xargs -r docker rm && ${dockerRunCmd.join(' ')}`;
-    }
-    
-    return dockerRunCmd;
-}
-
-function loadConfig(configFile) {
-    const configPath = path.resolve(configFile);
-    if (!fs.existsSync(configPath)) {
-        console.error(`\x1b[31mError: El archivo de configuración '${configPath}' no existe.\x1b[0m`);
-        process.exit(1);
-    }
-    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-    const defaults = { image: 'node:lts-slim', dockerOptions: {}, buildDir: 'build' };
-    return { ...defaults, ...config };
-}
-
-function run(command) {
-    try {
-        return execSync(command, { stdio: 'pipe' }).toString().trim();
-    } catch (error) {
-        return ""; // Devolver vacío en caso de error para que las comprobaciones no fallen
-    }
-}
-
-function compressDirectory(source, out) {
-    if (!fs.existsSync(source)) {
-        console.error(`\x1b[31mError: El directorio a comprimir '${source}' no existe.\x1b[0m`);
-        process.exit(1);
-    }
-    const archive = archiver('tar', { gzip: true });
-    const stream = fs.createWriteStream(out);
-    return new Promise((resolve, reject) => {
-        archive.directory(source, false).on('error', err => reject(err)).pipe(stream);
-        stream.on('close', () => resolve());
-        archive.finalize();
-    });
 }
 
 // Iniciar la ejecución
