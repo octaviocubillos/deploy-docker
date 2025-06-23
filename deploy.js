@@ -8,6 +8,9 @@ const { NodeSSH } = require('node-ssh');
 const semver = require('semver');
 const args = require('minimist')(process.argv.slice(2));
 
+
+let remoteEnvPath = null; // Variable para guardar la ruta del archivo .env remoto
+
 // --- Lógica Principal ---
 async function main() {
     const forceDeploy = args.force || args.f || false;
@@ -156,26 +159,27 @@ async function deployRemote(config, force = false, recreate = false) {
         performTokenReplacement(config, finalEnv);
         
         const { stdout: volumeHasCode } = await ssh.execCommand(`docker run --rm -v "${finalVolumeName}:/app" alpine ls /app/${entrypoint} 2>/dev/null`);
-        if (!volumeHasCode.includes(entrypoint)) {
+        //if (!volumeHasCode.includes(entrypoint)) {
             console.log("-> El volumen remoto está vacío. Subiendo código...");
             await compressDirectory(buildDir, archiveName);
             const remoteTempDir = `/tmp/deploy-${Date.now()}`;
+            console.log({remoteTempDir})
             await ssh.execCommand(`mkdir -p ${remoteTempDir}`);
             await ssh.putFile(path.resolve(archiveName), `${remoteTempDir}/${archiveName}`);
             await ssh.execCommand(`tar -xzf ${archiveName} -C ${remoteTempDir}`, { cwd: remoteTempDir });
             const copyToVolumeCmd = `docker run --rm -v "${remoteTempDir}:/origen" -v "${finalVolumeName}:/destino" alpine sh -c "cp -a /origen/. /destino/"`;
             await ssh.execCommand(copyToVolumeCmd);
-            await ssh.execCommand(`rm -rf ${remoteTempDir}`);
-        } else {
-            console.log("-> El volumen remoto ya contiene código. Saltando subida.");
-        }
+           // await ssh.execCommand(`rm -rf ${remoteTempDir}`);
+        // } else {
+        //     console.log("-> El volumen remoto ya contiene código. Saltando subida.");
+        // }
         
-        if (finalEnvContent) {
-            const remoteEnvPath = `${remoteBasePath}/.env.deploy`;
-            await ssh.execCommand(`echo "${finalEnvContent.replace(/"/g, '\\"')}" > ${remoteEnvPath}`);
-            config.remote.envFile = remoteEnvPath;
+         if (finalEnvContent) {
+            remoteEnvPath = `${remoteTempDir}/.env.deploy.tmp`;
+            console.log(`🔒 Creando archivo de entorno temporal en el servidor: ${remoteEnvPath}`);
+            const escapedContent = finalEnvContent.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
+            await ssh.execCommand(`cat <<'EOF' > ${remoteEnvPath}\n${escapedContent}\nEOF`);
         }
-
         const dockerCommand = buildDockerCommand(config, true);
         await ssh.execCommand(dockerCommand);
         console.log(`\n✅ Lanzamiento de ${finalContainerName} exitoso.`);
@@ -380,26 +384,36 @@ function buildEnvironment(config) {
 
 function buildDockerCommand(config, isRemote = false) {
     const { name, port, volume, image, dockerOptions, main: entrypoint = 'index.js' } = config;
-    const { finalEnvContent } = buildEnvironment(config);
-    let dockerRunCmd = [`docker run -d`, `--name "${name}"`, `-p "${port}:3000"`, `-v "${volume}:/app"`, `-w /app`];
+    const { finalEnvContent, finalEnv } = buildEnvironment(config);
+    const envPort = finalEnv.get('PORT') || 3000;
+    
+    let dockerRunCmd = [`docker run -d`, `--name "${name}"`, `-p "${port}:${envPort}"`, `-v "${volume}:/app"`, `-w /app`];
 
     if (dockerOptions.cpus) dockerRunCmd.push(`--cpus "${dockerOptions.cpus}"`);
     if (dockerOptions.memory) dockerRunCmd.push(`--memory "${dockerOptions.memory}"`);
     if (dockerOptions.restart) dockerRunCmd.push(`--restart "${dockerOptions.restart}"`);
     if (dockerOptions.hostname) dockerRunCmd.push(`--hostname "${dockerOptions.hostname}"`);
     if (dockerOptions.user) dockerRunCmd.push(`--user "${dockerOptions.user}"`);
-    if (dockerOptions.networks) dockerOptions.networks.forEach(net => dockerRunCmd.push(`--network "${net}"`));
-    if (dockerOptions.addHost) dockerRunCmd.addHost.forEach(host => dockerRunCmd.push(`--add-host "${host}"`));
-    if (dockerOptions.labels) dockerOptions.labels.forEach(label => dockerRunCmd.push(`--label "${label}"`));
-    
+    if (dockerOptions.networks) (dockerOptions.networks || []).forEach(net => dockerRunCmd.push(`--network "${net}"`));
+    if (dockerOptions.addHost) (dockerRunCmd.addHost || []).forEach(host => dockerRunCmd.push(`--add-host "${host}"`));
+    if (dockerOptions.labels) (dockerOptions.labels || []).forEach(label => dockerRunCmd.push(`--label "${label}"`));
+
     if (finalEnvContent) {
-        const envPath = isRemote ? config.remote.envFile : path.resolve('.env.deploy.local');
-        if (!isRemote) fs.writeFileSync(envPath, finalEnvContent);
-        dockerRunCmd.push(`--env-file "${envPath}"`);
+        let envPath;
+        if (isRemote) {
+            envPath = remoteEnvPath;
+        } else {
+            envPath = path.resolve('.env.deploy.local');
+            fs.writeFileSync(envPath, finalEnvContent);
+        }
+        
+        if (envPath) {
+            dockerRunCmd.push(`--env-file "${envPath}"`);
+        }
     }
     
     dockerRunCmd.push(`"${image}"`);
-    dockerRunCmd.push(`sh -c "if [ ! -d 'node_modules' ]; then npm install; fi; node ${entrypoint}"`);
+    dockerRunCmd.push(`sh -c " npm install; node ${entrypoint}"`);
 
     if (isRemote) {
         return `docker ps -a -q -f name=${name} | xargs -r docker stop && docker ps -a -q -f name=${name} | xargs -r docker rm && ${dockerRunCmd.join(' ')}`;
