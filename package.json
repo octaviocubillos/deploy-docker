@@ -1,6 +1,6 @@
 {
   "name": "@octavio.cubillos/deploy-docker",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Una herramienta CLI para desplegar aplicaciones Node.js en Docker de forma local o remota.",
   "main": "deploy.js",
   "bin": {
@@ -18,7 +18,8 @@
     "deploy",
     "cli",
     "ssh",
-    "node"
+    "node",
+    "automation"
   ],
   "author": "Octavio Cubillos",
   "license": "MIT",
@@ -27,8 +28,9 @@
   },
   "homepage": "https://github.com/octaviocubillos/deploy-docker#readme",
   "dependencies": {
-    "minimist": "^1.2.8",
     "archiver": "^7.0.1",
-    "node-ssh": "^13.2.0"
+    "minimist": "^1.2.8",
+    "node-ssh": "^13.2.0",
+    "semver": "^7.6.2"
   }
 }
