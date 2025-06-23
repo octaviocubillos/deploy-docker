@@ -64,17 +64,27 @@ async function deployLocal(config, force = false, recreate = false) {
             const oldContainer = run(`docker ps -a -q -f name=^${finalContainerName}$`);
             if (oldContainer) {
                 const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-                const archiveName = `${finalContainerName}-old-${timestamp}`;
-                console.log(` -> Renombrando contenedor '${finalContainerName}' a '${archiveName}'...`);
+                const archiveContainerName = `${finalContainerName}-old-${timestamp}`;
+                const archiveVolumeName = `${finalVolumeName}-old-${timestamp}`;
+                
+                console.log(` -> Creando volumen de respaldo '${archiveVolumeName}'...`);
+                run(`docker volume create ${archiveVolumeName}`);
+                
+                console.log(` -> Copiando datos de '${finalVolumeName}' a '${archiveVolumeName}'...`);
+                run(`docker run --rm -v "${finalVolumeName}:/from" -v "${archiveVolumeName}:/to" alpine sh -c "cp -a /from/. /to/"`);
+                
+                console.log(` -> Renombrando contenedor '${finalContainerName}' a '${archiveContainerName}'...`);
                 run(`docker stop ${finalContainerName}`);
-                run(`docker rename ${finalContainerName} ${archiveName}`);
-                console.log(`\x1b[33m   -> Nota: El volumen antiguo '${finalVolumeName}' no se puede renombrar y queda disponible para recuperación manual.\x1b[0m`);
+                run(`docker rename ${finalContainerName} ${archiveContainerName}`);
+                
+                console.log(` -> Eliminando volumen original '${finalVolumeName}'...`);
+                run(`docker volume rm ${finalVolumeName}`);
+                console.log(`\x1b[32m   -> Backup de contenedor y volumen completado.\x1b[0m`);
             }
         }
         
-        const checkFile = config.deployType === 'static' ? 'index.html' : entrypoint;
-        if (!fs.existsSync(buildDir) || !fs.existsSync(path.join(buildDir, checkFile))) {
-            console.error(`\x1b[31mError: La carpeta '${buildDir}' o su archivo principal '${checkFile}' no existen.\x1b[0m`);
+        if (!fs.existsSync(buildDir) || !fs.existsSync(path.join(buildDir, entrypoint))) {
+            console.error(`\x1b[31mError: La carpeta '${buildDir}' o su archivo principal '${entrypoint}' no existen.\x1b[0m`);
             process.exit(1);
         }
 
@@ -93,9 +103,13 @@ async function deployLocal(config, force = false, recreate = false) {
             packageJsonWasCreated = true;
         }
         
-        const volumeHasCode = run(`docker run --rm -v "${finalVolumeName}:/app" alpine ls /app/${checkFile} 2>/dev/null || true`).includes(checkFile);
-        if (!volumeHasCode) {
-            console.log("-> El volumen está vacío. Copiando código...");
+        const volumeHasCode = run(`docker run --rm -v "${finalVolumeName}:/app" alpine ls /app/${entrypoint} 2>/dev/null || true`).includes(entrypoint);
+        if (!volumeHasCode || force || recreate) {
+            if (force || recreate) {
+                console.log(`-> Forzando la actualización del código en el volumen debido al flag --${force ? 'force' : 'rm'}...`);
+            } else {
+                console.log("-> El volumen está vacío. Copiando código...");
+            }
             run(`docker run --rm -v "${path.resolve(buildDir)}:/origen" -v "${finalVolumeName}:/destino" alpine sh -c "cp -a /origen/. /destino/"`);
         } else {
             console.log("-> El volumen ya contiene código. Saltando copia.");
@@ -103,6 +117,8 @@ async function deployLocal(config, force = false, recreate = false) {
         
         const finalCommand = buildDockerCommand(config).join(' ');
         console.log('▶️  Lanzando el nuevo contenedor...');
+        run(`docker stop ${finalContainerName} 2>/dev/null || true`);
+        run(`docker rm ${finalContainerName} 2>/dev/null || true`);
         run(finalCommand);
         
         console.log(`\n✅ Lanzamiento de ${finalContainerName} exitoso.`);
@@ -123,27 +139,41 @@ async function deployLocal(config, force = false, recreate = false) {
 async function deployRemote(config, force = false, recreate = false) {
     console.log(`🚀 Iniciando despliegue REMOTO para tipo '${config.deployType}' a '${config.remote.host}'...`);
     const { name: baseName, version, remote, buildDir, main: entrypoint } = config;
-    const remoteBasePath = remote.path || `~/apps/${baseName}`;
-    const finalContainerName = `${baseName}-${version}`;
-    const finalVolumeName = `${baseName}-data-${version}`;
-    config.name = finalContainerName;
-    config.volume = finalVolumeName;
-
+    
     const ssh = new NodeSSH();
     const archiveName = 'deploy.tar.gz';
     const buildPackageJsonPath = path.join(buildDir, 'package.json');
     let packageJsonWasCreated = false;
     let remoteEnvPath = null;
+    let finalContainerName = `${baseName}-${version}`;
+    let finalVolumeName = `${baseName}-data-${version}`;
+    let remoteBasePath = remote.path || `/tmp/${baseName}`;
 
     try {
         const connectionConfig = { host: remote.host, username: remote.user };
-        if (remote.privateKeyPath) { connectionConfig.privateKeyPath = remote.privateKeyPath; } 
-        else if (remote.password) { connectionConfig.password = remote.password; } 
-        else { throw new Error('Debe proporcionar "privateKeyPath" o "password".'); }
+        if (remote.privateKeyPath) {
+            console.log(' -> Usando autenticación por clave SSH.');
+            connectionConfig.privateKeyPath = remote.privateKeyPath;
+        } else if (remote.password) {
+            console.log(' -> Usando autenticación por contraseña.');
+            connectionConfig.password = remote.password;
+        } else {
+            throw new Error('Debe proporcionar "privateKeyPath" o "password" en la configuración remota.');
+        }
+        console.log('🔌 Conectando al servidor...');
         await ssh.connect(connectionConfig);
+        
+        if (remoteBasePath.startsWith('~/')) {
+            const { stdout: homeDir } = await ssh.execCommand('echo $HOME');
+            if (!homeDir) throw new Error("No se pudo resolver el directorio HOME en el servidor remoto.");
+            remoteBasePath = path.posix.join(homeDir, remoteBasePath.substring(2));
+        }
+
+        config.name = finalContainerName;
+        config.volume = finalVolumeName;
 
         await checkProductionVersion(config, force, recreate, ssh);
-        
+
         if (recreate) {
             console.log(`\x1b[33m--rm flag detectado. Eliminando completamente la versión ${version} en el servidor remoto...\x1b[0m`);
             await ssh.execCommand(`docker stop ${finalContainerName} && docker rm ${finalContainerName}`, { onStderr: () => {} });
@@ -153,16 +183,30 @@ async function deployRemote(config, force = false, recreate = false) {
             const { stdout: oldContainer } = await ssh.execCommand(`docker ps -a -q -f name=^${finalContainerName}$`);
             if (oldContainer) {
                 const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-                const archiveName = `${finalContainerName}-old-${timestamp}`;
-                await ssh.execCommand(`docker stop ${finalContainerName} && docker rename ${finalContainerName} ${archiveName}`);
-                console.log(`\x1b[33m   -> Contenedor renombrado a '${archiveName}'. El volumen antiguo '${finalVolumeName}' queda disponible.\x1b[0m`);
+                const archiveContainerName = `${finalContainerName}-old-${timestamp}`;
+                const archiveVolumeName = `${finalVolumeName}-old-${timestamp}`;
+                
+                console.log(` -> Creando volumen de respaldo '${archiveVolumeName}'...`);
+                await ssh.execCommand(`docker volume create ${archiveVolumeName}`);
+                
+                console.log(` -> Copiando datos de '${finalVolumeName}' a '${archiveVolumeName}'...`);
+                await ssh.execCommand(`docker run --rm -v "${finalVolumeName}:/from" -v "${archiveVolumeName}:/to" alpine sh -c "cp -a /from/. /to/"`);
+                
+                console.log(` -> Renombrando contenedor '${finalContainerName}' a '${archiveContainerName}'...`);
+                await ssh.execCommand(`docker stop ${finalContainerName} && docker rename ${finalContainerName} ${archiveContainerName}`);
+
+                console.log(` -> Eliminando volumen original '${finalVolumeName}'...`);
+                await ssh.execCommand(`docker volume rm ${finalVolumeName}`);
+                console.log(`\x1b[32m   -> Backup de contenedor y volumen completado.\x1b[0m`);
             }
         }
         
         await stopAllOtherVersions(baseName, finalContainerName, ssh);
         await ensureVolumeExists(finalVolumeName, ssh);
-        if (config.dockerOptions.networks) await ensureNetworksExist(config.dockerOptions.networks, ssh);
-
+        if (config.dockerOptions && config.dockerOptions.networks) {
+            await ensureNetworksExist(config.dockerOptions.networks, ssh);
+        }
+        
         const { finalEnv, finalEnvContent } = buildEnvironment(config);
         if (config.deployType === 'node') {
             performTokenReplacement(config, finalEnv);
@@ -173,8 +217,12 @@ async function deployRemote(config, force = false, recreate = false) {
         }
         
         const { stdout: volumeHasCode } = await ssh.execCommand(`docker run --rm -v "${finalVolumeName}:/app" alpine ls /app/${entrypoint} 2>/dev/null`);
-        if (!volumeHasCode.includes(entrypoint)) {
-            console.log("-> El volumen remoto está vacío. Subiendo código...");
+        if (!volumeHasCode.includes(entrypoint) || force || recreate) {
+            if (force || recreate) {
+                console.log(`-> Forzando la actualización del código en el volumen remoto debido al flag --${force ? 'force' : 'rm'}...`);
+            } else {
+                console.log("-> El volumen remoto está vacío. Subiendo código...");
+            }
             await compressDirectory(buildDir, archiveName);
             const remoteTempDir = `/tmp/deploy-${Date.now()}`;
             await ssh.execCommand(`mkdir -p ${remoteTempDir}`);
@@ -191,23 +239,35 @@ async function deployRemote(config, force = false, recreate = false) {
             remoteEnvPath = `${remoteBasePath}/.env.deploy.tmp`;
             console.log(`🔒 Escribiendo variables de entorno en el servidor: ${remoteEnvPath}`);
             const escapedContent = finalEnvContent.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
-            await ssh.execCommand(`cat <<'EOF' > ${remoteEnvPath}\n${escapedContent}\nEOF`);
+            await ssh.execCommand(`mkdir -p $(dirname ${remoteEnvPath}) && cat <<'EOF' > ${remoteEnvPath}\n${escapedContent}\nEOF`);
         }
 
-        const dockerCommand = buildDockerCommand(config, true, remoteEnvPath);
-        await ssh.execCommand(dockerCommand);
+        const dockerRunCmdArray = buildDockerCommand(config, remoteEnvPath);
+        const dockerRunCmdString = dockerRunCmdArray.join(' ');
+        
+        console.log('▶️  Lanzando el nuevo contenedor remotamente...');
+        await ssh.execCommand(`docker stop ${finalContainerName} && docker rm ${finalContainerName}`, { onStderr: () => {} });
+        const { stderr: runError } = await ssh.execCommand(dockerRunCmdString);
+        if (runError) throw new Error(`Error al lanzar el contenedor: ${runError}`);
+
         console.log(`\n✅ Lanzamiento de ${finalContainerName} exitoso.`);
+        
         await pruneOldVersions(config, ssh);
         console.log(`\n🎉 ¡Éxito! El servicio '${finalContainerName}' está en ejecución en '${remote.host}'.`);
 
     } catch (error) {
         console.error(`\x1b[31m${error.message}\x1b[0m`);
+        process.exit(1);
     } finally {
         if (packageJsonWasCreated) {
             fs.unlinkSync(buildPackageJsonPath);
         }
-        if (remoteEnvPath) { await ssh.execCommand(`rm ${remoteEnvPath} 2>/dev/null || true`); }
-        if (fs.existsSync(archiveName)) { fs.unlinkSync(archiveName); }
+        if (remoteEnvPath) {
+            await ssh.execCommand(`rm ${remoteEnvPath} 2>/dev/null || true`);
+        }
+        if (fs.existsSync(archiveName)) {
+            fs.unlinkSync(archiveName);
+        }
         ssh.dispose();
     }
 }
@@ -227,17 +287,10 @@ function createCleanPackageJson(config) {
             dependencies: {}
         }, null, 2);
     }
-
     const originalPkg = JSON.parse(fs.readFileSync(rootPackageJsonPath, 'utf-8'));
-
     const cleanPkg = {
-        name: originalPkg.name,
-        version: originalPkg.version,
-        description: originalPkg.description || "Despliegue de " + originalPkg.name,
-        main: originalPkg.main || config.main,
-        dependencies: originalPkg.dependencies || {}
+        name: originalPkg.name, version: originalPkg.version, description: originalPkg.description || "Despliegue de " + originalPkg.name, main: originalPkg.main || config.main, dependencies: originalPkg.dependencies || {}
     };
-
     return JSON.stringify(cleanPkg, null, 2);
 }
 
@@ -258,68 +311,46 @@ function showHelp() {
     `);
 }
 
-function buildDockerCommand(config, isRemote = false, remoteEnvPath = null) {
+function buildDockerCommand(config, remoteEnvPath = null) {
     if (config.deployType === 'static') {
-        return buildStaticDockerCommand(config, isRemote);
+        return buildStaticDockerCommand(config);
     }
-    return buildNodeDockerCommand(config, isRemote, remoteEnvPath);
+    return buildNodeDockerCommand(config, remoteEnvPath);
 }
 
-function buildStaticDockerCommand(config, isRemote) {
+function buildStaticDockerCommand(config) {
     const { name, port, volume, dockerOptions } = config;
     const image = config.image;
-
-    let dockerRunCmd = [
-        `docker run -d`,
-        `--name "${name}"`,
-        `-p "${port}:80"`,
-        `-v "${volume}:/usr/share/nginx/html:ro"`,
-    ];
-
-    if (dockerOptions.restart) dockerRunCmd.push(`--restart "${dockerOptions.restart}"`);
-    if (dockerOptions.networks) (dockerOptions.networks || []).forEach(net => dockerRunCmd.push(`--network "${net}"`));
-    if (dockerOptions.labels) (dockerOptions.labels || []).forEach(label => dockerRunCmd.push(`--label "${label}"`));
-    if (dockerOptions.memory) dockerRunCmd.push(`--memory "${dockerOptions.memory}"`);
-    if (dockerOptions.cpus) dockerRunCmd.push(`--cpus "${dockerOptions.cpus}"`);
-    
+    let dockerRunCmd = [`docker run -d`, `--name "${name}"`, `-p "${port}:80"`, `-v "${volume}:/usr/share/nginx/html:ro"`];
+    if (dockerOptions && dockerOptions.restart) dockerRunCmd.push(`--restart "${dockerOptions.restart}"`);
+    if (dockerOptions && dockerOptions.networks) dockerOptions.networks.forEach(net => dockerRunCmd.push(`--network "${net}"`));
+    if (dockerOptions && dockerOptions.labels) dockerOptions.labels.forEach(label => dockerRunCmd.push(`--label "${label}"`));
+    if (dockerOptions && dockerOptions.memory) dockerRunCmd.push(`--memory "${dockerOptions.memory}"`);
+    if (dockerOptions && dockerOptions.cpus) dockerRunCmd.push(`--cpus "${dockerOptions.cpus}"`);
     dockerRunCmd.push(`"${image}"`);
-    const dockerRunStr = dockerRunCmd.join(' ');
-    
-    if (isRemote) {
-        return `docker ps -a -q -f name=${name} | xargs -r docker stop && docker ps -a -q -f name=${name} | xargs -r docker rm && ${dockerRunStr}`;
-    }
     return dockerRunCmd;
 }
 
-function buildNodeDockerCommand(config, isRemote = false, remoteEnvPath = null) {
+function buildNodeDockerCommand(config, remoteEnvPath = null) {
     const { name, port, volume, image, dockerOptions, main: entrypoint, customCommand } = config;
     const { finalEnvContent } = buildEnvironment(config);
     let dockerRunCmd = [`docker run -d`, `--name "${name}"`, `-p "${port}:3000"`, `-v "${volume}:/app"`, `-w /app`];
-
-    if (dockerOptions.cpus) dockerRunCmd.push(`--cpus "${dockerOptions.cpus}"`);
-    if (dockerOptions.memory) dockerRunCmd.push(`--memory "${dockerOptions.memory}"`);
-    if (dockerOptions.restart) dockerRunCmd.push(`--restart "${dockerOptions.restart}"`);
-    if (dockerOptions.hostname) dockerRunCmd.push(`--hostname "${dockerOptions.hostname}"`);
-    if (dockerOptions.user) dockerRunCmd.push(`--user "${dockerOptions.user}"`);
-    if (dockerOptions.networks) dockerOptions.networks.forEach(net => dockerRunCmd.push(`--network "${net}"`));
-    if (dockerOptions.addHost) dockerRunCmd.addHost.forEach(host => dockerRunCmd.push(`--add-host "${host}"`));
-    if (dockerOptions.labels) dockerOptions.labels.forEach(label => dockerRunCmd.push(`--label "${label}"`));
-    
+    if (dockerOptions && dockerOptions.cpus) dockerRunCmd.push(`--cpus "${dockerOptions.cpus}"`);
+    if (dockerOptions && dockerOptions.memory) dockerRunCmd.push(`--memory "${dockerOptions.memory}"`);
+    if (dockerOptions && dockerOptions.restart) dockerRunCmd.push(`--restart "${dockerOptions.restart}"`);
+    if (dockerOptions && dockerOptions.hostname) dockerRunCmd.push(`--hostname "${dockerOptions.hostname}"`);
+    if (dockerOptions && dockerOptions.user) dockerRunCmd.push(`--user "${dockerOptions.user}"`);
+    if (dockerOptions && dockerOptions.networks) dockerOptions.networks.forEach(net => dockerRunCmd.push(`--network "${net}"`));
+    if (dockerOptions && dockerOptions.addHost) dockerOptions.addHost.forEach(host => dockerRunCmd.push(`--add-host "${host}"`));
+    if (dockerOptions && dockerOptions.labels) dockerOptions.labels.forEach(label => dockerRunCmd.push(`--label "${label}"`));
     if (finalEnvContent) {
-        const envPath = isRemote ? remoteEnvPath : path.resolve('.env.deploy.local');
-        if (!isRemote) fs.writeFileSync(envPath, finalEnvContent);
+        const envPath = remoteEnvPath ? remoteEnvPath : path.resolve('.env.deploy.local');
+        if (!remoteEnvPath) fs.writeFileSync(envPath, finalEnvContent);
         if (envPath) dockerRunCmd.push(`--env-file "${envPath}"`);
     }
-    
     dockerRunCmd.push(`"${image}"`);
-    
     const finalExecCommand = customCommand || `sh -c "if [ ! -d 'node_modules' ]; then npm install; fi; node ${entrypoint}"`;
     dockerRunCmd.push(finalExecCommand);
-
-    const dockerRunStr = dockerRunCmd.join(' ');
-    if (isRemote) {
-        return `docker ps -a -q -f name=${name} | xargs -r docker stop && docker ps -a -q -f name=${name} | xargs -r docker rm && ${dockerRunStr}`;
-    }
     return dockerRunCmd;
 }
 
@@ -329,24 +360,14 @@ function loadConfig(configFile) {
         console.error(`\x1b[31mError: El archivo de configuración '${configPath}' no existe.\x1b[0m`);
         process.exit(1);
     }
-    
     const userConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-
-    const baseDefaults = {
-        deployType: 'node',
-        dockerOptions: {},
-        buildDir: 'build'
-    };
-    
+    const baseDefaults = { deployType: 'node', dockerOptions: {}, buildDir: 'build' };
     let config = { ...baseDefaults, ...userConfig };
-
     const typeDefaults = {
         main: config.deployType === 'static' ? 'index.html' : 'index.js',
         image: config.deployType === 'static' ? 'nginx:alpine' : 'node:lts-slim'
     };
-    
     config = { ...baseDefaults, ...typeDefaults, ...userConfig };
-
     return config;
 }
 
@@ -388,7 +409,7 @@ async function ensureVolumeExists(volumeName, ssh = null) {
 }
 
 async function ensureNetworksExist(networks = [], ssh = null) {
-    if (networks.length === 0) return;
+    if (!networks || networks.length === 0) return;
     console.log('- Verificando redes Docker...');
     const execute = ssh ? (cmd) => ssh.execCommand(cmd) : (cmd) => Promise.resolve({ stdout: run(cmd) });
     for (const network of networks) {
@@ -443,10 +464,15 @@ function buildEnvironment(config) {
 
 async function checkProductionVersion(config, force, recreate, ssh = null) {
     const { finalEnv } = buildEnvironment(config);
-    const nodeEnv = finalEnv.get('NODE_ENV');
-    if (nodeEnv !== 'production') return;
+    const envValue = (finalEnv.get('NODE_ENV') || finalEnv.get('ENV') || '').toLowerCase();
+    const productionValues = ['prod', 'product', 'production', 'produccion'];
+    const isProduction = productionValues.includes(envValue);
 
-    console.log(`- Validando versión para PRODUCCIÓN...`);
+    if (!isProduction) {
+        return;
+    }
+
+    console.log(`- Validando versión para entorno de PRODUCCIÓN...`);
 
     if (force || recreate) {
         console.log(`\x1b[33m  -> Saltando validación por flag --force o --rm.\x1b[0m`);
