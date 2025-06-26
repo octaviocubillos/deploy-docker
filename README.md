@@ -1,6 +1,6 @@
 # Herramienta de Despliegue Docker (deploy-docker)
 
-![Versión](https://img.shields.io/badge/version-1.0.7-blue.svg)
+![Versión](https://img.shields.io/badge/version-1.0.8-blue.svg)
 ![Licencia](https://img.shields.io/npm/l/@octavio.cubillos/deploy-docker)
 
 **deploy-docker** es una herramienta de línea de comandos (CLI) potente y flexible diseñada para automatizar y estandarizar el despliegue de aplicaciones en contenedores Docker. Permite gestionar el ciclo de vida completo de tus despliegues, desde entornos locales de desarrollo hasta servidores remotos de producción, con un único archivo de configuración.
@@ -25,7 +25,7 @@ Soporta despliegues de **Node.js** y sitios **estáticos (HTML/CSS/JS) con Nginx
 
 ## Instalación
 
-Puedes instalar la herramienta globalmente para uso general o localmente como una dependencia de desarrollo para mayor consistencia en equipos. La versión actual es **1.0.7**.
+Puedes instalar la herramienta globalmente para uso general o localmente como una dependencia de desarrollo para mayor consistencia en equipos. La versión actual es **1.0.8**.
 
 **Global:**
 ```bash
