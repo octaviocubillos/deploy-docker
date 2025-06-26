@@ -1,6 +1,6 @@
 {
   "name": "@octavio.cubillos/deploy-docker",
-  "version": "1.0.3",
+  "version": "1.0.7",
   "description": "Una herramienta CLI para desplegar aplicaciones Node.js en Docker de forma local o remota.",
   "main": "deploy.js",
   "bin": {
